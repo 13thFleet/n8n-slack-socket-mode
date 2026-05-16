@@ -18,6 +18,25 @@ interface SlackCredential {
 	signingSecret: string;
 }
 
+const REGEX_INPUT_MAX_LENGTH = 64 * 1024;
+const VALID_REGEX_FLAGS = /^[gimsuy]*$/;
+const UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+const redactSecrets = (input: string, signingSecret?: string): string => {
+	let out = input
+		.replace(/xox[abprs]-[A-Za-z0-9-]+/g, 'xoxX-***')
+		.replace(/xapp-[A-Za-z0-9-]+/g, 'xapp-***');
+	if (signingSecret && signingSecret.length >= 8) {
+		out = out.split(signingSecret).join('***');
+	}
+	return out;
+};
+
+const formatError = (error: unknown, signingSecret?: string): string => {
+	const message = error instanceof Error ? error.message : String(error);
+	return redactSecrets(message, signingSecret);
+};
+
 export class SlackSocketTrigger implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Slack Socket Mode Trigger',
@@ -730,7 +749,7 @@ export class SlackSocketTrigger implements INodeType {
 											{
 												type: 'regex',
 												properties: {
-													regex: '^[C|G|D][A-Z0-9]{8,}$',
+													regex: '^[CGD][A-Z0-9]{8,}$',
 													errorMessage: 'Not a valid Slack channel ID',
 												},
 											},
@@ -769,7 +788,7 @@ export class SlackSocketTrigger implements INodeType {
 							{
 								type: 'regex',
 								properties: {
-									regex: '^[C|G|D][A-Z0-9]{8,}$',
+									regex: '^[CGD][A-Z0-9]{8,}$',
 									errorMessage: 'Not a valid Slack channel ID',
 								},
 							},
@@ -817,7 +836,7 @@ export class SlackSocketTrigger implements INodeType {
 
 					return { results };
 				} catch (error) {
-					throw new NodeOperationError(this.getNode(), `Failed to load channels: ${error}`);
+					throw new NodeOperationError(this.getNode(), `Failed to load channels: ${formatError(error, credentials.signingSecret)}`);
 				}
 			},
 		},
@@ -851,13 +870,23 @@ export class SlackSocketTrigger implements INodeType {
 
 		const uniqueChannelIds = Array.from(new Set(channelIds));
 
-		const regExp = pattern.length > 0 ? new RegExp(pattern, flags) : undefined;
+		let regExp: RegExp | undefined;
+		if (pattern.length > 0) {
+			if (!VALID_REGEX_FLAGS.test(flags)) {
+				throw new NodeOperationError(this.getNode(), `Invalid regex flags: "${flags}". Allowed flags are g, i, m, s, u, y.`);
+			}
+			try {
+				regExp = new RegExp(pattern, flags);
+			} catch (error) {
+				throw new NodeOperationError(this.getNode(), `Invalid regex pattern: ${formatError(error)}`);
+			}
+		}
 
 		let credentials: SlackCredential;
 		try {
 			credentials = await this.getCredentials<SlackCredential>('slackSocketCredentialsApi');
 		} catch (error) {
-			throw new NodeOperationError(this.getNode(), 'Failed to get Slack Socket credentials: ' + error);
+			throw new NodeOperationError(this.getNode(), 'Failed to get Slack Socket credentials: ' + formatError(error));
 		}
 
 		if (!credentials.botToken || !credentials.appToken || !credentials.signingSecret) {
@@ -927,6 +956,9 @@ export class SlackSocketTrigger implements INodeType {
 
 				const sanitized: IDataObject = {};
 				for (const key of Object.keys(root)) {
+					if (UNSAFE_KEYS.has(key)) {
+						continue;
+					}
 					const val = root[key];
 					// do not include functions (ack, respond, etc.) as they are not serializable and not useful in the output
 					if (typeof val !== 'function') {
@@ -936,7 +968,7 @@ export class SlackSocketTrigger implements INodeType {
 
 				this.emit([this.helpers.returnJsonArray(sanitized)]);
 			} catch (error) {
-				this.logger.error('Error processing Slack Socket event: ' + error);
+				this.logger.error('Error processing Slack Socket event: ' + formatError(error, credentials.signingSecret));
 			}
 		}
 
@@ -952,8 +984,11 @@ export class SlackSocketTrigger implements INodeType {
 
 							if (regExp) {
 								const jsonString = JSON.stringify(event);
+								if (!jsonString || jsonString.length > REGEX_INPUT_MAX_LENGTH) {
+									return;
+								}
 								regExp.lastIndex = 0;
-								if (!jsonString || !regExp.test(jsonString)) {
+								if (!regExp.test(jsonString)) {
 									return;
 								}
 							}
@@ -976,7 +1011,7 @@ export class SlackSocketTrigger implements INodeType {
 									await args.ack();
 								}
 							} catch (err) {
-								this.logger.error('Error acknowledging view_submission: ' + err);
+								this.logger.error('Error acknowledging view_submission: ' + formatError(err, credentials.signingSecret));
 							}
 							await socketProcess(args);
 						});
@@ -988,7 +1023,7 @@ export class SlackSocketTrigger implements INodeType {
 									await args.ack();
 								}
 							} catch (err) {
-								this.logger.error('view_closed ack error (safe to ignore): ' + err);
+								this.logger.error('view_closed ack error (safe to ignore): ' + formatError(err, credentials.signingSecret));
 							}
 							await socketProcess(args);
 						});
@@ -998,7 +1033,7 @@ export class SlackSocketTrigger implements INodeType {
 							try {
 								await ack();
 							} catch (err) {
-								this.logger.error('Error acknowledging slash command: ' + err);
+								this.logger.error('Error acknowledging slash command: ' + formatError(err, credentials.signingSecret));
 							}
 
 							if (regExp && command) {
@@ -1052,8 +1087,11 @@ export class SlackSocketTrigger implements INodeType {
 
 							if (regExp) {
 								const jsonString = JSON.stringify(event);
+								if (!jsonString || jsonString.length > REGEX_INPUT_MAX_LENGTH) {
+									return;
+								}
 								regExp.lastIndex = 0;
-								if (!jsonString || !regExp.test(jsonString)) {
+								if (!regExp.test(jsonString)) {
 									return;
 								}
 							}
@@ -1079,7 +1117,7 @@ export class SlackSocketTrigger implements INodeType {
 						app.event(filter, socketProcess);
 					}
 				} catch (error) {
-					this.logger.error('Error setting up event listener for Slack Socket: ' + filter + ': ' + error);
+					this.logger.error('Error setting up event listener for Slack Socket: ' + filter + ': ' + formatError(error, credentials.signingSecret));
 				}
 			});
 		};
@@ -1091,7 +1129,7 @@ export class SlackSocketTrigger implements INodeType {
 				await app.start();
 				this.logger.info('Started Slack Socket app in test mode');
 			} catch (error) {
-				this.logger.error('Error starting Slack Socket app in test mode: ' + error);
+				this.logger.error('Error starting Slack Socket app in test mode: ' + formatError(error, credentials.signingSecret));
 				throw error;
 			}
 
@@ -1105,7 +1143,7 @@ export class SlackSocketTrigger implements INodeType {
 				await app.start();
 				this.logger.info('Started Slack Socket app in trigger mode');
 			} catch (error) {
-				this.logger.error('Error starting Slack Socket app in trigger mode: ' + error);
+				this.logger.error('Error starting Slack Socket app in trigger mode: ' + formatError(error, credentials.signingSecret));
 				throw error;
 			}
 		}
@@ -1116,7 +1154,7 @@ export class SlackSocketTrigger implements INodeType {
 				await app.stop();
 				this.logger.info('Stopped Slack Socket app');
 			} catch (error) {
-				this.logger.error('Error stopping Slack Socket app: ' + error);
+				this.logger.error('Error stopping Slack Socket app: ' + formatError(error, credentials.signingSecret));
 			}
 		};
 
